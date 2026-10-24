@@ -3,6 +3,7 @@ package bus
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -236,6 +237,96 @@ func TestSubscribe_AfterCloseFails(t *testing.T) {
 	err := b.Subscribe(context.Background(), "x", 1, 1, func(context.Context, Event) error { return nil })
 	if !errors.Is(err, ErrClosed) {
 		t.Fatalf("expected ErrClosed, got %v", err)
+	}
+}
+
+func TestPublish_BlockedTopicDoesNotFreezeOthers(t *testing.T) {
+	b := New(metrics.New(), PolicyBlock)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+	mustSubscribe(t, b, context.Background(), "slow", 1, 0, blockingHandler(started, release))
+	mustSubscribe(t, b, context.Background(), "fast", 1, 10, func(context.Context, Event) error { return nil })
+
+	_ = b.Publish("slow", "1")
+	<-started
+	go func() { _ = b.Publish("slow", "2") }() // blocks: worker busy, queue size 0
+	time.Sleep(20 * time.Millisecond)          // give it time to block (a shorter wait only weakens the test)
+
+	done := make(chan error, 2)
+	go func() {
+		done <- b.Subscribe(context.Background(), "other", 1, 1, func(context.Context, Event) error { return nil })
+		done <- b.Publish("fast", "x")
+	}()
+	expectErr(t, done, nil) // Subscribe must not wait for the blocked publisher
+	expectErr(t, done, nil) // nor must a publish to another topic
+}
+
+func TestPublish_AfterSubscriptionCancelledIsRejected(t *testing.T) {
+	m := metrics.New()
+	b := New(m, PolicyDrop)
+	ctx, cancel := context.WithCancel(context.Background())
+	mustSubscribe(t, b, ctx, "t", 1, 5, func(context.Context, Event) error { return nil })
+	cancel()
+
+	if err := b.Publish("t", "x"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("expected ErrClosed (no worker would ever handle it), got %v", err)
+	}
+	if got := m.Snapshot().Published; got != 0 {
+		t.Errorf("rejected event must not count as published, got %d", got)
+	}
+}
+
+func TestSubscribe_AllowedAgainAfterCancel(t *testing.T) {
+	b := New(metrics.New(), PolicyDrop)
+	ctx, cancel := context.WithCancel(context.Background())
+	noop := func(context.Context, Event) error { return nil }
+	mustSubscribe(t, b, ctx, "t", 1, 1, noop)
+	cancel()
+
+	mustSubscribe(t, b, context.Background(), "t", 1, 1, noop)
+	if err := b.Publish("t", "x"); err != nil {
+		t.Fatalf("publish to the new subscription: %v", err)
+	}
+	closeOrFail(t, b)
+}
+
+func TestClose_LeavesNoGoroutines(t *testing.T) {
+	before := runtime.NumGoroutine()
+
+	b := New(metrics.New(), PolicyBlock)
+	mustSubscribe(t, b, context.Background(), "a", 8, 16, func(context.Context, Event) error { return nil })
+	mustSubscribe(t, b, context.Background(), "b", 8, 16, func(context.Context, Event) error { return nil })
+	for i := 0; i < 100; i++ {
+		_ = b.Publish("a", "x")
+		_ = b.Publish("b", "x")
+	}
+	closeOrFail(t, b)
+
+	waitForGoroutines(t, before)
+}
+
+func TestCancel_LeavesNoGoroutines(t *testing.T) {
+	before := runtime.NumGoroutine()
+
+	b := New(metrics.New(), PolicyDrop)
+	ctx, cancel := context.WithCancel(context.Background())
+	mustSubscribe(t, b, ctx, "a", 8, 16, func(context.Context, Event) error { return nil })
+	cancel()
+
+	waitForGoroutines(t, before)
+}
+
+// waitForGoroutines fails if the goroutine count doesn't return to want.
+func waitForGoroutines(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for runtime.NumGoroutine() > want {
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutine leak: %d running, want %d", runtime.NumGoroutine(), want)
+		}
+		runtime.Gosched()
+		time.Sleep(time.Millisecond)
 	}
 }
 

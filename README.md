@@ -77,14 +77,14 @@ So events that were accepted with `202` are processed, not lost.
 go test ./internal/bus -run x -bench . -benchmem
 ```
 
-Example run (2 vCPU, Go 1.24):
+Average of 5 runs (2 vCPU, Go 1.24):
 
 | Benchmark | ns/op | allocs/op |
 |---|---|---|
-| Publish, 1 worker | ~460 | 0 |
-| Publish, 4 workers | ~760 | 0 |
-| Publish from parallel goroutines | ~700 | 0 |
-| Publish rejected (queue full, `PolicyDrop`) | ~115 | 0 |
+| Publish, 1 worker | ~610 | 0 |
+| Publish, 4 workers | ~640 | 0 |
+| Publish from parallel goroutines | ~580 | 0 |
+| Publish rejected (queue full, `PolicyDrop`) | ~125 | 0 |
 
 `Publish` does no heap allocations: the `Event` is copied into the
 channel by value, so publishing adds no GC pressure.
@@ -104,7 +104,8 @@ make test
 Covers: rate limiter burst/refill/capacity cap (with a fake clock, no
 sleeps), duplicate subscriptions, drop-on-full, blocking backpressure,
 failed and panicking handlers, graceful `Close` (drain, timeout, releasing
-blocked publishers), and the HTTP status code for each outcome. Tests are
+blocked publishers), no cross-topic blocking, no goroutine leaks after
+`Close` or cancel, and the HTTP status code for each outcome. Tests are
 synchronized with channels instead of `time.Sleep`, and pass under `-race`.
 
 ## Design notes / trade-offs
@@ -113,6 +114,13 @@ synchronized with channels instead of `time.Sleep`, and pass under `-race`.
   a slow or failing topic can't starve others sharing the process.
 - **One subscription per topic**: subscribing twice to the same topic
   returns `ErrAlreadySubscribed` instead of silently replacing the queue.
+  After a subscription's context is cancelled, publishing to it returns
+  `ErrClosed` (no worker would ever handle the event), and the topic can be
+  subscribed again.
+- **No lock held while sending**: the bus lock only covers the topic
+  lookup. A publisher blocked on a full topic doesn't hold up other topics
+  or `Subscribe`. `Close` tracks in-flight publishers and closes the queues
+  only after they are gone, so there is never a send on a closed channel.
 - **No retry/DLQ**: a failed handler is counted and moved on, deliberately
   — retry semantics vary a lot by use case, so it's left as a decision for
   the handler itself (e.g. publish to a `topic.failed` topic) rather than
