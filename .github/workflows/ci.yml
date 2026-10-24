@@ -7,13 +7,26 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: test (Go ${{ matrix.go }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        # The minimum version from go.mod, and the latest stable release.
+        go: [go.mod, stable]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
+        if: matrix.go == 'go.mod'
         with:
           go-version-file: go.mod
+          cache: false # no dependencies, so nothing to cache
+
+      - uses: actions/setup-go@v7
+        if: matrix.go == 'stable'
+        with:
+          go-version: stable
+          cache: false
 
       - name: Check formatting
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
@@ -21,21 +34,24 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Staticcheck
-        uses: dominikh/staticcheck-action@v1
-        with:
-          install-go: false
-
       - name: Test
         run: go test -race -cover ./...
 
       - name: Build
         run: go build ./...
 
-  vulncheck:
-    runs-on: ubuntu-latest
+  lint:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: golang/govulncheck-action@v1
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: stable
+          cache: false
+
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+
+      - name: Govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
