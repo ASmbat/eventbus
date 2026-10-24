@@ -1,7 +1,7 @@
-// Package bus implements a small in-process, topic-based event bus: each
-// topic has its own bounded queue and worker pool, so one slow topic can't
-// starve another, and publishers get an explicit signal (an error, not
-// silent loss) when a topic's queue is full.
+// Package bus implements a small in-process, topic-based event bus.
+// Each topic has its own bounded queue and worker pool, so one slow topic
+// can't starve another, and publishers get an explicit error (not silent
+// loss) when a queue is full.
 package bus
 
 import (
@@ -16,25 +16,19 @@ import (
 )
 
 var (
-	ErrNoSubscribers = errors.New("no subscribers for topic")
-	ErrQueueFull     = errors.New("topic queue is full")
-	// ErrClosed is returned by a PolicyBlock Publish that was unblocked by
-	// the topic's subscription context being cancelled (e.g. shutdown)
-	// rather than by the event actually being enqueued.
-	ErrClosed = errors.New("topic subscription closed")
+	ErrNoSubscribers     = errors.New("no subscribers for topic")
+	ErrQueueFull         = errors.New("topic queue is full")
+	ErrClosed            = errors.New("bus or subscription closed")
+	ErrAlreadySubscribed = errors.New("topic already has a subscriber")
 )
 
 // Policy controls what Publish does when a topic's queue is full.
 type Policy int
 
 const (
-	// PolicyDrop rejects the event immediately (Publish returns
-	// ErrQueueFull) rather than blocking the publisher. Appropriate when
-	// producers must never be slowed down by a struggling consumer.
+	// PolicyDrop rejects the event right away with ErrQueueFull.
 	PolicyDrop Policy = iota
-	// PolicyBlock applies backpressure: Publish blocks until the queue
-	// has room. Appropriate when losing events is worse than a slow
-	// publisher.
+	// PolicyBlock waits until the queue has room (backpressure).
 	PolicyBlock
 )
 
@@ -45,21 +39,23 @@ type Event struct {
 	Timestamp time.Time
 }
 
-// Handler processes one event. A non-nil error is counted as a failure but
-// does not stop the worker or requeue the event — retry policy is
-// intentionally left to the caller (e.g. a handler that publishes to a
-// dead-letter topic on failure).
+// Handler processes one event. A returned error is counted as a failure;
+// the event is not retried. Retry or dead-letter logic belongs to the handler.
 type Handler func(ctx context.Context, e Event) error
 
 type subscription struct {
-	ctx     context.Context
-	queue   chan Event
-	workers int
+	ctx   context.Context
+	queue chan Event
 }
 
 type Bus struct {
 	mu      sync.RWMutex
 	subs    map[string]*subscription
+	closed  bool
+	closing chan struct{} // closed when Close starts; unblocks waiting publishers
+	once    sync.Once
+	workers sync.WaitGroup
+
 	metrics *metrics.Metrics
 	policy  Policy
 }
@@ -67,42 +63,56 @@ type Bus struct {
 func New(m *metrics.Metrics, policy Policy) *Bus {
 	return &Bus{
 		subs:    make(map[string]*subscription),
+		closing: make(chan struct{}),
 		metrics: m,
 		policy:  policy,
 	}
 }
 
-// Subscribe registers a handler for topic, backed by `workers` goroutines
-// consuming from a queue of size `queueSize`. It must be called before any
-// Publish calls for that topic (a Publish to an unknown topic returns
-// ErrNoSubscribers rather than silently succeeding). Workers stop when ctx
-// is cancelled.
-func (b *Bus) Subscribe(ctx context.Context, topic string, workers, queueSize int, handler Handler) {
-	sub := &subscription{
-		ctx:     ctx,
-		queue:   make(chan Event, queueSize),
-		workers: workers,
+// Subscribe registers handler for topic, with `workers` goroutines reading
+// from a queue of size queueSize. Each topic can have one subscription.
+//
+// Cancelling ctx stops the workers at once (queued events are dropped).
+// Use Close for a graceful stop that processes queued events first.
+func (b *Bus) Subscribe(ctx context.Context, topic string, workers, queueSize int, handler Handler) error {
+	if workers < 1 {
+		return fmt.Errorf("workers must be >= 1, got %d", workers)
+	}
+	if queueSize < 0 {
+		return fmt.Errorf("queueSize must be >= 0, got %d", queueSize)
 	}
 
 	b.mu.Lock()
-	b.subs[topic] = sub
-	b.mu.Unlock()
+	defer b.mu.Unlock()
 
-	for i := 0; i < workers; i++ {
-		go b.worker(ctx, sub, handler)
+	if b.closed {
+		return ErrClosed
 	}
+	if _, exists := b.subs[topic]; exists {
+		return fmt.Errorf("%w: %q", ErrAlreadySubscribed, topic)
+	}
+
+	sub := &subscription{ctx: ctx, queue: make(chan Event, queueSize)}
+	b.subs[topic] = sub
+
+	b.workers.Add(workers)
+	for i := 0; i < workers; i++ {
+		go b.worker(sub, handler)
+	}
+	return nil
 }
 
-func (b *Bus) worker(ctx context.Context, sub *subscription, handler Handler) {
+func (b *Bus) worker(sub *subscription, handler Handler) {
+	defer b.workers.Done()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-sub.ctx.Done():
 			return
 		case e, ok := <-sub.queue:
 			if !ok {
-				return
+				return // queue closed by Close and fully drained
 			}
-			if err := b.invoke(ctx, handler, e); err != nil {
+			if err := b.invoke(sub.ctx, handler, e); err != nil {
 				b.metrics.IncFailed()
 				continue
 			}
@@ -111,12 +121,8 @@ func (b *Bus) worker(ctx context.Context, sub *subscription, handler Handler) {
 	}
 }
 
-// invoke calls handler for a single event, converting a panic into an error
-// instead of letting it unwind past the worker goroutine. An unrecovered
-// panic in any goroutine crashes the entire process, so without this a
-// single bad event (or a bug triggered only by certain payloads) in one
-// handler would take down every topic on the bus, not just the one that
-// misbehaved.
+// invoke runs the handler and turns a panic into an error, so one bad
+// event can't crash the whole process.
 func (b *Bus) invoke(ctx context.Context, handler Handler, e Event) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -127,38 +133,69 @@ func (b *Bus) invoke(ctx context.Context, handler Handler, e Event) (err error) 
 	return handler(ctx, e)
 }
 
-// Publish sends an event to topic, honoring the bus's backpressure Policy.
+// Publish sends an event to topic, following the bus's Policy.
 func (b *Bus) Publish(topic, payload string) error {
+	// The read lock is held while sending so Close can't close the queue
+	// mid-send. A blocked publisher is released through b.closing.
 	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if b.closed {
+		return ErrClosed
+	}
 	sub, ok := b.subs[topic]
-	b.mu.RUnlock()
 	if !ok {
 		return ErrNoSubscribers
 	}
 
 	event := Event{Topic: topic, Payload: payload, Timestamp: time.Now()}
 
-	switch b.policy {
-	case PolicyBlock:
-		// Without also selecting on the subscription's context, a publisher
-		// that's blocked here when the topic shuts down (workers stop
-		// draining the queue) would block forever — a permanent goroutine
-		// leak, and in an HTTP handler, a request that never completes.
+	if b.policy == PolicyBlock {
 		select {
 		case sub.queue <- event:
 			b.metrics.IncPublished()
 			return nil
 		case <-sub.ctx.Done():
 			return ErrClosed
+		case <-b.closing:
+			return ErrClosed
 		}
-	default: // PolicyDrop
-		select {
-		case sub.queue <- event:
-			b.metrics.IncPublished()
-			return nil
-		default:
-			b.metrics.IncDropped()
-			return ErrQueueFull
+	}
+
+	select {
+	case sub.queue <- event:
+		b.metrics.IncPublished()
+		return nil
+	default:
+		b.metrics.IncDropped()
+		return ErrQueueFull
+	}
+}
+
+// Close stops accepting new events, lets workers finish everything already
+// queued, and waits for them until ctx is done. It is safe to call more than once.
+func (b *Bus) Close(ctx context.Context) error {
+	b.once.Do(func() {
+		close(b.closing) // release publishers blocked under PolicyBlock
+
+		b.mu.Lock()
+		b.closed = true
+		for _, sub := range b.subs {
+			close(sub.queue)
 		}
+		b.mu.Unlock()
+	})
+
+	done := make(chan struct{})
+	go func() {
+		b.workers.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for workers: %w", ctx.Err())
 	}
 }

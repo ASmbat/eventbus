@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/ASmbat/eventbus/internal/bus"
 	"github.com/ASmbat/eventbus/internal/metrics"
@@ -20,9 +19,9 @@ func newTestHandler(t *testing.T) *Handler {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	b.Subscribe(ctx, "orders", 1, 10, func(_ context.Context, e bus.Event) error {
-		return nil
-	})
+	if err := b.Subscribe(ctx, "orders", 1, 10, func(context.Context, bus.Event) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
 
 	limiter := ratelimit.NewTokenBucket(100, 100) // generous, so tests aren't flaky
 	return New(b, m, limiter)
@@ -57,7 +56,9 @@ func TestPublish_RateLimited(t *testing.T) {
 	b := bus.New(m, bus.PolicyDrop)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	b.Subscribe(ctx, "orders", 1, 10, func(_ context.Context, e bus.Event) error { return nil })
+	if err := b.Subscribe(ctx, "orders", 1, 10, func(context.Context, bus.Event) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
 
 	limiter := ratelimit.NewTokenBucket(1, 0.001) // capacity 1, effectively no refill
 	h := New(b, m, limiter)
@@ -98,7 +99,6 @@ func TestMetricsEndpoint(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/publish/orders", strings.NewReader("x"))
 	h.Routes().ServeHTTP(httptest.NewRecorder(), req)
-	time.Sleep(20 * time.Millisecond) // let the worker process it
 
 	mreq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rr := httptest.NewRecorder()
@@ -107,8 +107,23 @@ func TestMetricsEndpoint(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
 	}
-	if !strings.Contains(rr.Body.String(), "published") {
-		t.Errorf("expected metrics body to mention published count, got %s", rr.Body.String())
+	if !strings.Contains(rr.Body.String(), `"published":1`) {
+		t.Errorf("expected published count of 1, got %s", rr.Body.String())
+	}
+}
+
+func TestPublish_AfterCloseReturns503(t *testing.T) {
+	h := newTestHandler(t)
+	if err := h.bus.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/publish/orders", strings.NewReader("x"))
+	rr := httptest.NewRecorder()
+	h.Routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 after shutdown, got %d", rr.Code)
 	}
 }
 

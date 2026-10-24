@@ -5,8 +5,19 @@ import (
 	"time"
 )
 
+// fakeClock is a manually advanced clock, so tests don't need time.Sleep.
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time          { return c.t }
+func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+func newTestBucket(capacity, refill float64) (*TokenBucket, *fakeClock) {
+	c := &fakeClock{t: time.Unix(0, 0)}
+	return newTokenBucket(capacity, refill, c.now), c
+}
+
 func TestTokenBucket_AllowsBurstUpToCapacity(t *testing.T) {
-	tb := NewTokenBucket(3, 1) // 3 tokens, refills slowly
+	tb, _ := newTestBucket(3, 1)
 
 	for i := 0; i < 3; i++ {
 		if !tb.Allow() {
@@ -14,45 +25,39 @@ func TestTokenBucket_AllowsBurstUpToCapacity(t *testing.T) {
 		}
 	}
 	if tb.Allow() {
-		t.Fatal("expected 4th immediate call to be denied once capacity is exhausted")
-	}
-}
-
-func TestTokenBucket_CapsRefillAtCapacity(t *testing.T) {
-	tb := NewTokenBucket(2, 100) // fast refill, small capacity
-	// Drain it, then simulate a long idle period so refill would
-	// overshoot capacity if not clamped.
-	tb.Allow()
-	tb.Allow()
-	tb.mu.Lock()
-	tb.last = time.Now().Add(-10 * time.Second)
-	tb.mu.Unlock()
-
-	// Should allow exactly 2 (capacity), not more, even though 100/sec
-	// refill over 10s would imply 1000 tokens.
-	if !tb.Allow() {
-		t.Fatal("expected token to be available after refill")
-	}
-	if !tb.Allow() {
-		t.Fatal("expected second token to be available after refill")
-	}
-	if tb.Allow() {
-		t.Fatal("expected refill to be capped at bucket capacity")
+		t.Fatal("expected 4th call to be denied")
 	}
 }
 
 func TestTokenBucket_RefillsOverTime(t *testing.T) {
-	tb := NewTokenBucket(1, 10) // 1 capacity, refills fast
+	tb, clock := newTestBucket(1, 10) // 1 token per 100ms
 
 	if !tb.Allow() {
 		t.Fatal("expected first call to be allowed")
 	}
+	clock.advance(50 * time.Millisecond)
 	if tb.Allow() {
-		t.Fatal("expected immediate second call to be denied")
+		t.Fatal("expected denial after only half a token of refill")
 	}
-
-	time.Sleep(150 * time.Millisecond) // ~1.5 tokens worth of refill at 10/sec
+	clock.advance(50 * time.Millisecond)
 	if !tb.Allow() {
-		t.Fatal("expected call to be allowed after refill window")
+		t.Fatal("expected call to be allowed after a full token refilled")
+	}
+}
+
+func TestTokenBucket_CapsRefillAtCapacity(t *testing.T) {
+	tb, clock := newTestBucket(2, 100)
+	tb.Allow()
+	tb.Allow()
+
+	clock.advance(10 * time.Second) // would be 1000 tokens without the cap
+
+	for i := 0; i < 2; i++ {
+		if !tb.Allow() {
+			t.Fatalf("expected token %d after refill", i)
+		}
+	}
+	if tb.Allow() {
+		t.Fatal("expected refill to be capped at capacity")
 	}
 }

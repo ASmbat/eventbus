@@ -1,5 +1,5 @@
-// Package ratelimit provides a small token-bucket limiter, used here to
-// protect the publish endpoint from bursty producers.
+// Package ratelimit provides a small token-bucket limiter, used to protect
+// the publish endpoint from bursty producers.
 package ratelimit
 
 import (
@@ -13,30 +13,33 @@ type TokenBucket struct {
 	tokens       float64
 	refillPerSec float64
 	last         time.Time
+	now          func() time.Time // replaceable in tests
 }
 
-// NewTokenBucket creates a bucket holding up to capacity tokens, refilled
-// at refillPerSec tokens per second. It starts full.
+// NewTokenBucket creates a full bucket of capacity tokens that refills at
+// refillPerSec tokens per second.
 func NewTokenBucket(capacity, refillPerSec float64) *TokenBucket {
+	return newTokenBucket(capacity, refillPerSec, time.Now)
+}
+
+func newTokenBucket(capacity, refillPerSec float64, now func() time.Time) *TokenBucket {
 	return &TokenBucket{
 		capacity:     capacity,
 		tokens:       capacity,
 		refillPerSec: refillPerSec,
-		last:         time.Now(),
+		last:         now(),
+		now:          now,
 	}
 }
 
-// Allow reports whether a single unit of work may proceed right now,
-// consuming one token if so.
+// Allow reports whether one request may proceed now, using one token if so.
 func (t *TokenBucket) Allow() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	now := time.Now()
-	elapsed := now.Sub(t.last).Seconds()
+	now := t.now()
+	t.tokens += now.Sub(t.last).Seconds() * t.refillPerSec
 	t.last = now
-
-	t.tokens += elapsed * t.refillPerSec
 	if t.tokens > t.capacity {
 		t.tokens = t.capacity
 	}

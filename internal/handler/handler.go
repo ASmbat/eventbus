@@ -38,11 +38,8 @@ func (h *Handler) publish(w http.ResponseWriter, r *http.Request) {
 	const maxBody = 1 << 20 // 1MB cap
 
 	topic := r.PathValue("topic")
-	// Read one byte past the cap so an oversized body can be told apart
-	// from one that happens to be exactly maxBody: io.LimitReader silently
-	// truncates rather than erroring, so without this check a body over
-	// the limit was accepted (202) with its payload quietly cut short
-	// instead of being rejected.
+	// Read one byte past the cap: io.LimitReader truncates silently, so
+	// this is how an oversized body is detected and rejected.
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "could not read body")
@@ -61,6 +58,8 @@ func (h *Handler) publish(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "no subscribers for topic "+topic)
 	case errors.Is(err, bus.ErrQueueFull):
 		writeError(w, http.StatusServiceUnavailable, "topic queue full, try again shortly")
+	case errors.Is(err, bus.ErrClosed):
+		writeError(w, http.StatusServiceUnavailable, "server is shutting down")
 	default:
 		writeError(w, http.StatusInternalServerError, "could not publish event")
 	}
